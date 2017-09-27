@@ -1,0 +1,582 @@
+{
+    "$schema": "https://schema.management.azure.com/schemas/2015-01-01/deploymentTemplate.json#",
+    "contentVersion": "1.0.0.0",
+    "parameters": {
+        "adminUsername": {
+            "type": "string",
+            "metadata": {
+                "description": "Username for the Virtual Machine."
+            }
+        },
+        "adminSSHKey": {
+            "type": "securestring",
+            "metadata": {
+                "description": "OS Admin SSH Key depending on value of authentication type"
+            }
+        },
+        "dnsLabelPrefix": {
+            "type": "string",
+            "metadata": {
+                "description": "Unique DNS Name for the Public IP used to access the Virtual Machine."
+            },
+            "defaultValue": "[concat('msimeta',uniquestring(resourceGroup().id,deployment().name))]"
+        },
+        "location": {
+            "type": "string",
+            "metadata": {
+                "description": "The Location For the resources"
+            },
+            "defaultValue": "[resourceGroup().location]"
+        },
+        "vmSize": {
+            "type": "string",
+            "metadata": {
+                "description": "The size of the VM to create"
+            },
+            "defaultValue": "Standard_DS1_V2"
+        },
+        "_artifactsLocation": {
+            "type": "string",
+            "metadata": {
+                "description": "The base URI where artifacts required by this template are located. When the template is deployed using the accompanying scripts, a private location in the subscription will be used and this value will be automatically generated."
+            },
+            "defaultValue": "__artifactsLocation"
+        },
+        "_artifactsStorageSasToken": {
+            "type": "string",
+            "metadata": {
+                "description": "The SAS token in case the artifacts are stored on an Azure Storage account rather than a public Git repository!"
+            },
+            "defaultValue": "__artifactsStorageSasToken"
+        },
+        "publisher": {
+            "type": "string",
+            "metadata": {
+                "description": "The VM Publisher"
+            },
+            "defaultValue": "Canonical"
+        },
+        "offer": {
+            "type": "string",
+            "metadata": {
+                "description": "The VM Offer"
+            },
+            "defaultValue": "UbuntuServer"
+        },
+        "SKU": {
+            "type": "string",
+            "metadata": {
+                "description": "The VM SKU"
+            },
+            "defaultValue": "16.04-LTS"
+        },
+        "serverCount": {
+            "type": "int",
+            "metadata": {
+                "description": "The number of backend servers to deploy"
+            },
+            "minValue": 2,
+            "maxValue": 9,
+            "defaultValue": 3
+        },
+        "rbacGuids": {
+            "type": "array",
+            "metadata": {
+                "description": "Exactly ONE UNIQUE GUID for each server VM is needed in this array for the RBAC assignments (sorry for that)! WARNING: if you want to keep this template deployment repeatable, you must generate new GUIDs for every run or delete RBAC assignments before running it, again!"
+            },
+            "defaultValue": [
+                "12f66315-2fdf-460a-9c53-8654ae72c390", 
+                "12f66315-2fdf-460a-9c53-8654ae72c391", 
+                "12f66315-2fdf-460a-9c53-8654ae72c392", 
+                "12f66315-2fdf-460a-9c53-8654ae72c393",
+                "12f66315-2fdf-460a-9c53-8654ae72c394",
+                "12f66315-2fdf-460a-9c53-8654ae72c395",
+                "12f66315-2fdf-460a-9c53-8654ae72c396",
+                "12f66315-2fdf-460a-9c53-8654ae72c397",
+                "12f66315-2fdf-460a-9c53-8654ae72c398",
+                "12f66315-2fdf-460a-9c53-8654ae72c399"
+            ],
+            "minLength": 4,
+            "maxLength": 18
+        }
+    },
+    "variables": {
+        "storageAccountName": "[take(concat(uniquestring(resourceGroup().id), parameters('dnsLabelPrefix')),24)]",
+        "vnetName": "msiTestVnet",
+        "vnetIpPrefix": "10.0.0.0/16",
+        "vnetSubnetJumpBoxName": "lxMsiVnetJumpSub",
+        "vnetSubnetJumpBoxIpPrefix": "10.0.1.0/24",
+        "vnetSubnetJumpBoxRef": "[resourceId('Microsoft.Network/virtualNetworks/subnets',variables('vnetName'),variables('vnetSubnetJumpBoxName'))]",
+        "vnetSubnetServerName": "lxMsiVnetServerSub",
+        "vnetSubnetServerIpPrefix": "10.0.2.0/24",
+        "vnetSubnetServerRef": "[resourceId('Microsoft.Network/virtualNetworks/subnets',variables('vnetName'),variables('vnetSubnetServerName'))]",
+        "nsgName": "lxMsiNsg",
+        "nsgRef": "[resourceId('Microsoft.Network/networkSecurityGroups',variables('nsgName'))]",
+        "jumpBoxPublicIpName": "lxMsiJumpPublicIp",
+        "jumpBoxPublicIpRef": "[resourceId('Microsoft.Network/publicIpAddresses',variables('jumpBoxPublicIpName'))]",
+        "jumpBoxNicName": "lxMsiJumpNic",
+        "jumpBoxVmName": "lxMsiJumpVm",
+        "serversLbName": "lxMsiLoadBalancer",
+        "serversLbId": "[resourceId('Microsoft.Network/loadBalancers', variables('serversLbName'))]",
+        "serversLbFrontEndIpConfigName": "lxMsiLbFrontendIpConfig",
+        "serversLbFrontEndIpConfigId": "[concat(variables('serversLbId'),'/frontendIPConfigurations/',variables('serversLbFrontEndIpConfigName'))]",
+        "serversFrontIpName": "lxMisServerPublicIp",
+        "serversAvSetName": "lxMsiAvailabilitySet",
+        "serversAvSetId": "[resourceId('Microsoft.Compute/availabilitySets', variables('serversAvSetName'))]",
+        "serversPublicIpRef": "[resourceId('Microsoft.Network/publicIPAddresses', variables('serversFrontIpName'))]",
+        "serversPortMapStart": 10000,
+        "serverNicNamePrefix": "lxMsiServerNic",
+        "serverVmNamePrefix": "lxMsiServerVm",
+        "linuxVmSshConfiguration": {
+            "disablePasswordAuthentication": true,
+            "ssh": {
+                "publicKeys": [
+                    {
+                        "path": "[concat('/home/',parameters('adminUsername'),'/.ssh/authorized_keys')]",
+                        "keyData": "[parameters('adminSSHKey')]"
+                    }
+                ]
+            }
+        },
+        "msiExtensionPort": "50342",
+        "rbacContributorRole": "[concat('/subscriptions/',subscription().subscriptionId,'/providers/Microsoft.Authorization/roleDefinitions/b24988ac-6180-42a0-ab88-20f7382dd24c')]",
+        "computeAPIVersion": "2017-03-30",
+        "storageAPIVersion": "2016-12-01",
+        "networkAPIVersion": "2016-09-01",
+        "managedIdentityAPIVersion": "2015-08-31-PREVIEW",
+        "authAPIVersion": "2016-07-01"
+    },
+    "resources": [
+        {
+            "apiVersion": "[variables('storageAPIVersion')]",
+            "type": "Microsoft.Storage/storageAccounts",
+            "name": "[variables('storageAccountName')]",
+            "location": "[parameters('Location')]",
+            "sku": {
+                "name": "Standard_LRS"
+            },
+            "kind": "Storage",
+            "properties": {}
+        },
+        {
+            "apiVersion": "[variables('networkAPIVersion')]",
+            "type": "Microsoft.Network/virtualNetworks",
+            "name": "[variables('vnetName')]",
+            "location": "[parameters('location')]",
+            "properties": {
+                "addressSpace": {
+                    "addressPrefixes": [
+                        "[variables('vnetIpPrefix')]"
+                    ]
+                },
+                "subnets": [
+                    {
+                        "name": "[variables('vnetSubnetJumpBoxName')]",
+                        "properties": {
+                            "addressPrefix": "[variables('vnetSubnetJumpBoxIpPrefix')]"
+                        }
+                    },
+                    {
+                        "name": "[variables('vnetSubnetServerName')]",
+                        "properties": {
+                            "addressPrefix": "[variables('vnetSubnetServerIpPrefix')]"
+                        }
+                    }
+                ]
+            }
+        },
+        {
+            "apiVersion": "[variables('networkAPIVersion')]",
+            "type": "Microsoft.Network/networkSecurityGroups",
+            "name": "[variables('nsgName')]",
+            "location": "[parameters('location')]",
+            "properties": {
+                "securityRules": [
+                    {
+                        "name": "default-allow-ssh",
+                        "properties": {
+                            "priority": 1000,
+                            "sourceAddressPrefix": "*",
+                            "protocol": "*",
+                            "destinationPortRange": "22",
+                            "access": "Allow",
+                            "direction": "Inbound",
+                            "sourcePortRange": "*",
+                            "destinationAddressPrefix": "*"
+                        }
+                    },
+                    {
+                        "name": "default-allow-httpin",
+                        "properties": {
+                            "priority": 1010,
+                            "sourceAddressPrefix": "VirtualNetwork",
+                            "protocol": "*",
+                            "destinationPortRange": "80",
+                            "access": "Allow",
+                            "direction": "Inbound",
+                            "sourcePortRange": "*",
+                            "destinationAddressPrefix": "*"
+                        }
+                    },
+                    {
+                        "name": "default-allow-serversin",
+                        "properties": {
+                            "priority": 1020,
+                            "protocol": "Tcp",
+                            "sourcePortRange": "*",
+                            "sourceAddressPrefix": "*",
+                            "destinationPortRange": "8080",
+                            "destinationAddressPrefix": "*",
+                            "access": "Allow",
+                            "direction": "Inbound"
+                        }
+                    },
+                    {
+                        "name": "default-allow-lbnatin",
+                        "properties": {
+                            "priority": 1030,
+                            "protocol": "Tcp",
+                            "sourcePortRange": "*",
+                            "sourceAddressPrefix": "*",
+                            "destinationPortRange": "[concat(variables('serversPortMapStart'),'-',add(variables('serversPortMapStart'),10))]",
+                            "destinationAddressPrefix": "*",
+                            "access": "Allow",
+                            "direction": "Inbound"
+                        }
+                    }
+                ]
+            }
+        },
+        {
+            "apiVersion": "[variables('networkAPIVersion')]",
+            "type": "Microsoft.Network/publicIPAddresses",
+            "name": "[variables('jumpBoxPublicIpName')]",
+            "location": "[parameters('location')]",
+            "properties": {
+                "publicIPAllocationMethod": "Dynamic",
+                "dnsSettings": {
+                    "domainNameLabel": "[parameters('dnsLabelPrefix')]"
+                }
+            }
+        },
+        {
+            "apiVersion": "[variables('networkAPIVersion')]",
+            "type": "Microsoft.Network/publicIPAddresses",
+            "name": "[variables('serversFrontIpName')]",
+            "location": "[parameters('location')]",
+            "properties": {
+                "publicIPAllocationMethod": "Dynamic",
+                "dnsSettings": {
+                    "domainNameLabel": "[concat(parameters('dnsLabelPrefix'),'srv')]"
+                }
+            }
+        },
+        {
+            "apiVersion": "[variables('computeAPIVersion')]",
+            "name": "[variables('serversAvSetName')]",
+            "type": "Microsoft.Compute/availabilitySets",
+            "location": "[parameters('location')]",
+            "sku": {
+                "name": "Aligned"
+            },
+            "properties": {
+                "platformFaultDomainCount": 3,
+                "platformUpdateDomainCount": 3
+            }
+        },
+        {
+            "apiVersion": "[variables('networkAPIVersion')]",
+            "name": "[variables('serversLbName')]",
+            "type": "Microsoft.Network/loadBalancers",
+            "location": "[parameters('location')]",
+            "dependsOn": [
+                "[concat('Microsoft.Network/publicIPAddresses/', variables('serversFrontIpName'))]"
+            ],
+            "properties": {
+                "frontendIPConfigurations": [
+                    {
+                        "name": "[variables('serversLbFrontEndIpConfigName')]",
+                        "properties": {
+                            "publicIPAddress": {
+                                "id": "[variables('serversPublicIpRef')]"
+                            }
+                        }
+                    }
+                ],
+                "backendAddressPools": [
+                    {
+                    "name": "lbServerBackendPool"
+                    }
+                ]
+            }
+        },
+        {
+            "apiVersion": "[variables('networkAPIVersion')]",
+            "type": "Microsoft.Network/loadBalancers/inboundNatRules",
+            "name": "[concat(variables('serversLbName'), '/', 'query', copyIndex())]",
+            "location": "[parameters('location')]",
+            "copy": {
+                "name": "lbNatLoop",
+                "count": "[parameters('serverCount')]"
+            },
+            "dependsOn": [
+                "[concat('Microsoft.Network/loadBalancers/', variables('serversLbName'))]"
+            ],
+            "properties": {
+                "frontendIPConfiguration": {
+                    "id": "[variables('serversLbFrontEndIpConfigId')]"
+                },
+                "protocol": "tcp",
+                "frontendPort": "[copyIndex(variables('serversPortMapStart'))]",
+                "backendPort": 8080,
+                "enableFloatingIP": false
+            }
+        },
+        {
+            "apiVersion": "[variables('networkAPIVersion')]",
+            "type": "Microsoft.Network/networkInterfaces",
+            "name": "[variables('jumpBoxNicName')]",
+            "location": "[parameters('location')]",
+            "dependsOn": [
+                "[resourceId('Microsoft.Network/publicIPAddresses',variables('jumpBoxPublicIpName'))]",
+                "[resourceId('Microsoft.Network/virtualNetworks',variables('vnetName'))]"
+            ],
+            "properties": {
+                "ipConfigurations": [
+                    {
+                        "name": "ipconfig1",
+                        "properties": {
+                            "privateIPAllocationMethod": "Dynamic",
+                            "subnet": {
+                                "id": "[variables('vnetSubnetJumpBoxRef')]"
+                            },
+                            "publicIPAddress": {
+                                "id": "[variables('jumpBoxPublicIpRef')]"
+                            }
+                        }
+                    }
+                ],
+                "networkSecurityGroup": {
+                    "id": "[variables('nsgRef')]"
+                }
+            }
+        },
+        {
+            "apiVersion": "[variables('computeAPIVersion')]",
+            "type": "Microsoft.Compute/virtualMachines",
+            "name": "[variables('jumpBoxVmName')]",
+            "location": "[parameters('location')]",
+            "dependsOn": [
+                "[resourceId('Microsoft.Network/networkInterfaces',variables('jumpBoxNicName'))]",
+                "[resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName'))]"
+            ],
+            "properties": {
+                "hardwareProfile": {
+                    "vmSize": "[parameters('vmSize')]"
+                },
+                "osProfile": {
+                    "computerName": "[variables('jumpBoxVmName')]",
+                    "adminUsername": "[parameters('adminUsername')]",
+                    "adminPassword": "",
+                    "linuxConfiguration": "[variables('linuxVmSshConfiguration')]"
+                },
+                "storageProfile": {
+                    "imageReference": {
+                        "publisher": "[parameters('publisher')]",
+                        "offer": "[parameters('offer')]",
+                        "sku": "[parameters('SKU')]",
+                        "version": "latest"
+                    },
+                    "osDisk": {
+                        "createOption": "FromImage"
+                    }
+                },
+                "networkProfile": {
+                    "networkInterfaces": [
+                        {
+                            "id": "[resourceId('Microsoft.Network/networkInterfaces',variables('jumpBoxNicName'))]"
+                        }
+                    ]
+                },
+                "diagnosticsProfile": {
+                    "bootDiagnostics": {
+                        "enabled": true,
+                        "storageUri": "[reference(concat('Microsoft.Storage/storageAccounts/',variables('storageAccountName')),variables('storageAPIVersion')).primaryEndpoints.blob]"
+                    }
+                }
+            }
+        },
+        {
+            "apiVersion": "[variables('networkAPIVersion')]",
+            "type": "Microsoft.Network/networkInterfaces",
+            "copy": {
+                "name": "serverNicCopy",
+                "count": "[parameters('serverCount')]"
+            },
+            "name": "[concat(variables('serverNicNamePrefix'), copyIndex())]",
+            "location": "[parameters('location')]",
+            "dependsOn": [
+                "[resourceId('Microsoft.Network/virtualNetworks',variables('vnetName'))]",
+                "[concat('Microsoft.Network/loadBalancers/',variables('serversLbName'))]",
+                "[concat('Microsoft.Network/loadBalancers/',variables('serversLbName'),'/inboundNatRules/query',copyIndex())]"
+            ],
+            "properties": {
+                "ipConfigurations": [
+                    {
+                        "name": "ipconfig1",
+                        "properties": {
+                            "privateIPAllocationMethod": "Dynamic",
+                            "subnet": {
+                                "id": "[variables('vnetSubnetServerRef')]"
+                            },
+                            "loadBalancerBackendAddressPools": [
+                                {
+                                    "id": "[concat(variables('serversLbId'),'/backendAddressPools/lbServerBackendPool')]"
+                                }
+                            ],
+                            "loadBalancerInboundNatRules": [
+                                {
+                                    "id": "[concat(variables('serversLbId'),'/inboundNatRules/query',copyIndex())]"
+                                }
+                            ]
+                        }
+                    }
+                ],
+                "networkSecurityGroup": {
+                    "id": "[variables('nsgRef')]"
+                }
+            }
+        },
+        {
+            "apiVersion": "[variables('computeAPIVersion')]",
+            "type": "Microsoft.Compute/virtualMachines",
+            "copy": {
+                "name": "serverVmCopy",
+                "count": "[parameters('serverCount')]"
+            },
+            "name": "[concat(variables('serverVmNamePrefix'), copyIndex())]",
+            "location": "[parameters('location')]",
+            "identity": {
+                "type": "systemAssigned"
+            },
+            "dependsOn": [
+                "[resourceId('Microsoft.Network/networkInterfaces',concat(variables('serverNicNamePrefix'),copyIndex()))]",
+                "[resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName'))]",
+                "[variables('serversAvSetId')]"
+            ],
+            "properties": {
+                "availabilitySet": {
+                    "id": "[variables('serversAvSetId')]"
+                },
+                "hardwareProfile": {
+                    "vmSize": "[parameters('vmSize')]"
+                },
+                "osProfile": {
+                    "computerName": "[concat(variables('serverVmNamePrefix'),copyIndex())]",
+                    "adminUsername": "[parameters('adminUsername')]",
+                    "adminPassword": "",
+                    "linuxConfiguration": "[variables('linuxVmSshConfiguration')]"
+                },
+                "storageProfile": {
+                    "imageReference": {
+                        "publisher": "[parameters('publisher')]",
+                        "offer": "[parameters('offer')]",
+                        "sku": "[parameters('SKU')]",
+                        "version": "latest"
+                    },
+                    "osDisk": {
+                        "createOption": "FromImage"
+                    }
+                },
+                "networkProfile": {
+                    "networkInterfaces": [
+                        {
+                            "id": "[resourceId('Microsoft.Network/networkInterfaces',concat(variables('serverNicNamePrefix'),copyIndex()))]"
+                        }
+                    ]
+                },
+                "diagnosticsProfile": {
+                    "bootDiagnostics": {
+                        "enabled": true,
+                        "storageUri": "[reference(concat('Microsoft.Storage/storageAccounts/',variables('storageAccountName')),variables('storageAPIVersion')).primaryEndpoints.blob]"
+                    }
+                }
+            }
+        },
+        {
+            "apiVersion": "[variables('authAPIVersion')]",
+            "type": "Microsoft.Authorization/roleAssignments",
+            "name": "[parameters('rbacGuids')[add(mul(copyIndex(),2),1)]]",
+            "comments": "You can retrieve the role definition ID with a simple Azure CLI command such as 'az role definition list --query \"[?properties.roleName == 'Contributor']\" --out json'",
+            "copy": {
+                "name": "serverVmRbacDeployment",
+                "count": "[parameters('serverCount')]"
+            },
+            "dependsOn": [
+                "[resourceId('Microsoft.Compute/virtualMachines', concat(variables('serverVmNamePrefix'), copyIndex()))]"
+            ],
+            "properties": {
+                "roleDefinitionId": "[variables('rbacContributorRole')]",
+                "principalId": "[reference(concat(resourceId('Microsoft.Compute/virtualMachines',concat(variables('serverVmNamePrefix'),copyIndex())),'/providers/Microsoft.ManagedIdentity/Identities/default'),variables('managedIdentityAPIVersion')).principalId]",
+                "scope": "[resourceGroup().id]"
+            }
+        },
+        {
+            "apiVersion": "[variables('computeAPIVersion')]",
+            "type": "Microsoft.Compute/virtualMachines/extensions",
+            "name": "[concat(variables('serverVmNamePrefix'),copyIndex(),'/IdentityExtension')]",
+            "location": "[parameters('location')]",
+            "copy": {
+                "name": "serverVmMsiExtensionCopy",
+                "count": "[parameters('serverCount')]"
+            },
+            "dependsOn": [
+                "[resourceId('Microsoft.Compute/virtualMachines', concat(variables('serverVmNamePrefix'), copyIndex()))]"
+            ],
+            "properties": {
+                "publisher": "Microsoft.ManagedIdentity",
+                "type": "ManagedIdentityExtensionForLinux",
+                "typeHandlerVersion": "1.0",
+                "autoUpgradeMinorVersion": true,
+                "settings": {
+                    "port": "[variables('msiExtensionPort')]"
+                },
+                "protectedSettings": {}
+            }
+        },
+        {
+            "apiVersion": "[variables('computeAPIVersion')]",
+            "type": "Microsoft.Compute/virtualMachines/extensions",
+            "name": "[concat(variables('serverVmNamePrefix'),copyIndex(),'/SetupScriptExtension')]",
+            "location": "[parameters('location')]",
+            "copy": {
+                "name": "serverVmSetupExtensionCopy",
+                "count": "[parameters('serverCount')]"
+            },
+            "dependsOn": [
+                "[resourceId('Microsoft.Compute/virtualMachines',concat(variables('serverVmNamePrefix'), copyIndex()))]",
+                "[concat('Microsoft.Compute/virtualMachines/', concat(variables('serverVmNamePrefix'),copyIndex()),'/extensions/IdentityExtension')]"
+            ],
+            "properties": {
+                "publisher": "Microsoft.Azure.Extensions",
+                "type": "CustomScript",
+                "typeHandlerVersion": "2.0",
+                "autoUpgradeMinorVersion": true,
+                "settings": {
+                    "fileUris": [
+                        "[concat(parameters('_artifactsLocation'),'/scripts/setup_server_node.sh',parameters('_artifactsStorageSasToken'))]",
+                        "[concat(parameters('_artifactsLocation'),'/scripts/template.msiandmeta.sh',parameters('_artifactsStorageSasToken'))]",
+                        "[concat(parameters('_artifactsLocation'),'/app/main.go',parameters('_artifactsStorageSasToken'))]",
+                        "[concat(parameters('_artifactsLocation'),'/app/handlers.go',parameters('_artifactsStorageSasToken'))]",
+                        "[concat(parameters('_artifactsLocation'),'/app/metadata.go',parameters('_artifactsStorageSasToken'))]",
+                        "[concat(parameters('_artifactsLocation'),'/app/msitoken.go',parameters('_artifactsStorageSasToken'))]",
+                        "[concat(parameters('_artifactsLocation'),'/app/mypeers.go',parameters('_artifactsStorageSasToken'))]"
+                    ]
+                },
+                "protectedSettings": {
+                    "commandToExecute": "[concat('./setup_server_node.sh -a ', parameters('adminUsername'), ' -s ', subscription().subscriptionId, ' -r ', resourceGroup().name)]"
+                }
+            }
+        }
+    ]
+}
